@@ -1,0 +1,135 @@
+# !usr/bin/env python
+# -*- coding:utf-8 _*-
+"""
+@Time: 2023/03/29
+@Author: Wang Yang
+"""
+import torch
+import torch.nn as nn
+
+
+class TemporalShift(nn.Module):
+    def __init__(self, net, n_seg=8, n_div=8, inplace=False):
+        super(TemporalShift, self).__init__()
+        self.net = net
+        self.n_seg = n_seg
+        self.n_div = n_div
+        self.inplace = inplace
+
+    def forward(self, x):
+        x = self.shift(x, self.n_seg, n_div=self.n_div, inplace=self.inplace)
+        return self.net(x)
+
+    @staticmethod
+    def shift(x, n_seg, n_div=8, inplace=False):
+        nt, c, h, w = x.size()
+        n_batch = nt // n_seg
+        x = x.view(n_batch, n_seg, c, h, w)
+
+        fold = c // n_div
+        if inplace:
+            # Due to some out of order error when performing parallel computing.
+            # May need to write a CUDA kernel.
+            raise NotImplementedError
+            # out = InplaceShift.apply(x, fold)
+        else:
+            out = torch.zeros_like(x)
+            out[:, :-1, :fold] = x[:, 1:, :fold]  # shift left
+            out[:, 1:, fold: 2 * fold] = x[:, :-1, fold: 2 * fold]  # shift right
+            out[:, :, 2 * fold:] = x[:, :, 2 * fold:]  # not shift
+
+        return out.view(nt, c, h, w)
+
+
+class Bottleneck(nn.Module):
+    def __init__(self, in_channels, out_channels, stride=1, downsampling=False, expansion=4, n_seg=8, n_div=8):
+        super(Bottleneck,self).__init__()
+        self.expansion = expansion
+        self.downsampling = downsampling
+
+        self.conv1 = TemporalShift(nn.Conv2d(in_channels=in_channels, out_channels=out_channels, kernel_size=1, stride=1, bias=False), n_seg, n_div)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.conv2 = nn.Conv2d(in_channels=out_channels, out_channels=out_channels, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.conv3 = nn.Conv2d(in_channels=out_channels, out_channels=out_channels * self.expansion, kernel_size=1, stride=1, bias=False)
+        self.bn3 = nn.BatchNorm2d(out_channels * self.expansion)
+        if self.downsampling:
+            self.downsample = nn.Sequential(
+                nn.Conv2d(in_channels=in_channels, out_channels=out_channels * self.expansion, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(out_channels * self.expansion)
+            )
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        residual = x
+
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+        out = self.relu(out)
+
+        out = self.conv3(out)
+        out = self.bn3(out)
+
+        if self.downsampling:
+            residual = self.downsample(x)
+
+        out += residual
+        out = self.relu(out)
+        return out
+
+
+class TSM(nn.Module):
+    def __init__(self, num_cls=2, n_seg=8, n_div=8, dropout=0.5):
+        super(TSM, self).__init__()
+        self.num_cls = num_cls
+        self.n_seg = n_seg
+        self.n_div = n_div
+
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channels=3, out_channels=64, kernel_size=7, stride=2, padding=3, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        )
+
+        def make_layer(in_channels, out_channels, block, stride):
+            layers = [Bottleneck(in_channels, out_channels, stride, downsampling=True)]
+            for i in range(1, block):
+                layers.append(Bottleneck(out_channels * 4, out_channels))
+            return nn.Sequential(*layers)
+        blocks = [3, 4, 6, 3]
+        self.layer1 = make_layer(64, 64, blocks[0], stride=1)
+        self.layer2 = make_layer(256, 128, blocks[0], stride=1)
+        self.layer3 = make_layer(512, 256, blocks[0], stride=1)
+        self.layer4 = make_layer(1024, 512, blocks[0], stride=1)
+
+        self.avgpool2d = nn.AdaptiveAvgPool2d((1, 1))
+        self.dropout = nn.Dropout(dropout)
+        self.fc = nn.Linear(2048, self.num_cls)
+
+    def forward(self, x):
+        out = self.conv(x)
+        out = self.layer1(out)
+        out = self.layer2(out)
+        out = self.layer3(out)
+        out = self.layer4(out)
+
+        out = self.avgpool2d(out)
+
+        out = torch.reshape(out, [-1, self.n_seg, out.shape[1]])
+        out = torch.mean(out, dim=1)
+
+        out = self.dropout(out)
+        out = self.fc(out)
+        return out
+
+
+if __name__ == "__main__":
+    tsm = TSM().cuda('cuda:0')
+    a = torch.randn(16, 3, 224, 224).cuda('cuda:0')
+    b = tsm(a)
+    print('test')
